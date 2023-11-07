@@ -623,22 +623,19 @@ class RWKV(pl.LightningModule):
         def checkpointed_step(idx, targets, prev_loss, last_shift_states,
                               last_wkv_states, prev_token_amount, seq_num):
             logits, new_shift_states, new_wkv_states = self(idx, last_shift_states, last_wkv_states)
-            current_token_amount = (targets!=-100).sum() #这样是不是更合适？
+            current_token_amount = (targets!=-100).sum() 
             # current_token_amount = idx.shape[1]
             if current_token_amount == 0:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1),reduction='sum')
             else:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1))
-                #loss.backward()
-                loss = L2Wrap.apply(loss, logits, current_token_amount, seq_num)
-            loss*=seq_num
+                _ = L2Wrap.apply(loss, logits, current_token_amount, seq_num)
             new_token_amount = prev_token_amount+current_token_amount
             if new_token_amount>0:
                 new_loss = prev_loss * (prev_token_amount / new_token_amount) + loss * (
                     current_token_amount / new_token_amount)
             else:
                 new_loss = prev_loss
-            print(new_loss)
             return new_loss, new_shift_states, new_wkv_states, new_token_amount
         
         total_loss = torch.tensor(0.,dtype=self.emb.weight.dtype).requires_grad_()
@@ -646,18 +643,6 @@ class RWKV(pl.LightningModule):
         i = 0
         seq_num = math.ceil(T / T_train)
         for i in range(seq_num):
-            # pdb.set_trace()
-            # total_loss, states, token_amount = deepspeed.checkpointing.checkpoint(
-            # total_loss,new_shift_states, new_wkv_states,token_amount = torch_checkpoint(
-            #     checkpointed_step,
-            #     idx[:, i * T_train:(i + 1) * T_train],
-            #     targets[:, i * T_train:(i + 1) * T_train],
-            #     total_loss,
-            #     states.shift_states,
-            #     states.wkv_states,
-            #     token_amount,
-            #     # use_reentrant=False
-            # )
             total_loss, new_shift_states, new_wkv_states, token_amount = checkpointed_step(
                 idx[:, i * T_train:(i + 1) * T_train],
                 targets[:, i * T_train:(i + 1) * T_train],
@@ -668,14 +653,7 @@ class RWKV(pl.LightningModule):
                 seq_num
             )
             states = BlockStateList(new_shift_states, new_wkv_states)
-        #total_loss.backward()
-            # if total_loss.isnan().all():
-            #     import transformers
-            #     tokenizer = transformers.PreTrainedTokenizerFast(tokenizer_file="20B_tokenizer.json")
-            #     pdb.set_trace()
-        # pdb.set_trace()
-        
-        # pdb.set_trace()
+
         return total_loss
     
     def training_step_end(self, batch_parts):
