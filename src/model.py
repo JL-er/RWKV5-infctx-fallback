@@ -434,10 +434,10 @@ class Block(nn.Module):
 
 class L2Wrap(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, loss, y, token_amount, seq_num):
+    def forward(ctx, loss, y, token_amount):
         ctx.save_for_backward(y)
         ctx.token_amount = token_amount
-        return loss/seq_num
+        return loss
 
     @staticmethod
     def backward(ctx, grad_output): #这个函数会不会影响batch和grad_accu的一致性？感觉上会。梯度累积时，factor变大了。但是只有loss缩放，这里的正则化项反而没有缩放
@@ -453,7 +453,7 @@ class L2Wrap(torch.autograd.Function):
             gy.scatter_(-1, ids, maxx * factor * grad_output)
         else:
             gy.scatter_(-1, ids, maxx * factor)
-        return (grad_output, gy, None, None)
+        return (grad_output, gy, None)
 
 
 class RWKV(pl.LightningModule):
@@ -557,6 +557,7 @@ class RWKV(pl.LightningModule):
     def deepspeed_offload(self) -> bool:
         strategy = self.trainer.strategy
         if isinstance(strategy, DeepSpeedStrategy):
+            #ZeRO-Offload
             cfg = strategy.config["zero_optimization"]
             return cfg.get("offload_optimizer") or cfg.get("offload_param")
         return False
@@ -611,27 +612,31 @@ class RWKV(pl.LightningModule):
         args = self.args
         T_train = args.real_len 
         idx, targets = batch
-        idx = idx.to('cpu')
-        targets = targets.to('cpu')
+        idx = idx.cpu()
+        targets = targets.cpu()
         B, T = idx.shape
         C = args.n_embd
         H =  args.dim_att // args.head_size_a
         assert C==H*args.head_size_a
         states = BlockStateList.create(args.n_layer, B, C, H, 'cuda',
             self.emb.weight.dtype)
-
+        # init_states = states
+        # init_states.shift_states.requires_grad_()
+        # init_states.wkv_states.requires_grad_()
         def checkpointed_step(idx, targets, prev_loss, last_shift_states,
                               last_wkv_states, prev_token_amount, seq_num):
-            idx = idx.to('cuda')
-            targets = targets.to('cuda')
+            idx = idx.cuda()
+            targets = targets.cuda()
             logits, new_shift_states, new_wkv_states = self(idx, last_shift_states, last_wkv_states)
-            current_token_amount = (targets!=-100).sum() 
+            current_token_amount = (targets!=-100).sum() #这样是不是更合适？
+            
             # current_token_amount = idx.shape[1]
             if current_token_amount == 0:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1),reduction='sum')
             else:
                 loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.reshape(-1))
-                _ = L2Wrap.apply(loss, logits, current_token_amount, seq_num)
+                loss = L2Wrap.apply(loss, logits, current_token_amount)
+                
             new_token_amount = prev_token_amount+current_token_amount
             if new_token_amount>0:
                 new_loss = prev_loss * (prev_token_amount / new_token_amount) + loss * (
@@ -645,17 +650,24 @@ class RWKV(pl.LightningModule):
         i = 0
         seq_num = math.ceil(T / T_train)
         for i in range(seq_num):
-            total_loss, new_shift_states, new_wkv_states, token_amount = checkpointed_step(
+            segment_loss, new_shift_states, new_wkv_states, token_amount = checkpointed_step(
                 idx[:, i * T_train:(i + 1) * T_train],
                 targets[:, i * T_train:(i + 1) * T_train],
-                total_loss,
+                torch.tensor(0, dtype=self.emb.weight.dtype, device='cuda').requires_grad_(True),
                 states.shift_states,
                 states.wkv_states,
                 token_amount,
                 seq_num
             )
             states = BlockStateList(new_shift_states, new_wkv_states)
-
+            learning_loss = segment_loss / seq_num
+            if i == seq_num-1:
+                total_loss = total_loss + segment_loss
+            else:
+                learning_loss.backward(retain_graph=True)
+                total_loss = total_loss + segment_loss.clone().detach().requires_grad_(False)
+        
+        
         return total_loss
     
     def training_step_end(self, batch_parts):
