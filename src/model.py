@@ -611,17 +611,19 @@ class RWKV(pl.LightningModule):
         args = self.args
         T_train = args.real_len 
         idx, targets = batch
+        idx = idx.to('cpu')
+        targets = targets.to('cpu')
         B, T = idx.shape
         C = args.n_embd
         H =  args.dim_att // args.head_size_a
         assert C==H*args.head_size_a
-        states = BlockStateList.create(args.n_layer, B, C, H, idx.device,
+        states = BlockStateList.create(args.n_layer, B, C, H, 'cuda',
             self.emb.weight.dtype)
-        # init_states = states
-        # init_states.shift_states.requires_grad_()
-        # init_states.wkv_states.requires_grad_()
+
         def checkpointed_step(idx, targets, prev_loss, last_shift_states,
                               last_wkv_states, prev_token_amount, seq_num):
+            idx = idx.to('cuda')
+            targets = targets.to('cuda')
             logits, new_shift_states, new_wkv_states = self(idx, last_shift_states, last_wkv_states)
             current_token_amount = (targets!=-100).sum() 
             # current_token_amount = idx.shape[1]
